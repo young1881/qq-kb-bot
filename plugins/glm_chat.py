@@ -1,13 +1,17 @@
 import os
+import asyncio
 from pathlib import Path
 
-import httpx
 from dotenv import load_dotenv
 from loguru import logger
 
+try:
+    from zai import ZhipuAiClient
+except ImportError:
+    ZhipuAiClient = None
+
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
-GLM_API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
 SYSTEM_PROMPT = """你是「津酒昴」（群友昵称酒老师）在 QQ 群里的嘴替，俗称赛博分身。语料库没匹配到的问题才轮到你即兴发挥。
 
 人设与语气：
@@ -34,9 +38,32 @@ SYSTEM_PROMPT = """你是「津酒昴」（群友昵称酒老师）在 QQ 群里
 def _glm_config():
     return {
         "api_key": os.getenv("ZHIPU_API_KEY", "").strip(),
-        "model": os.getenv("GLM_MODEL", "glm-4.7-flash").strip(),
-        "max_tokens": int(os.getenv("GLM_MAX_TOKENS", "128")),
+        "model": os.getenv("GLM_MODEL", "glm-4.7").strip(),
+        "max_tokens": int(os.getenv("GLM_MAX_TOKENS", "65536")),
     }
+
+
+def _message_content(message) -> str:
+    if isinstance(message, dict):
+        return (message.get("content") or "").strip()
+    return (getattr(message, "content", "") or "").strip()
+
+
+def _chat_completion(cfg: dict[str, str | int], question: str) -> str:
+    client = ZhipuAiClient(api_key=cfg["api_key"])
+    response = client.chat.completions.create(
+        model=cfg["model"],
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": question},
+        ],
+        thinking={
+            "type": "enabled",
+        },
+        max_tokens=cfg["max_tokens"],
+        temperature=1.0,
+    )
+    return _message_content(response.choices[0].message)
 
 
 async def ask_glm(question: str) -> str | None:
@@ -45,39 +72,19 @@ async def ask_glm(question: str) -> str | None:
         logger.warning("ZHIPU_API_KEY 未配置，跳过大模型兜底")
         return None
 
-    payload = {
-        "model": cfg["model"],
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": question},
-        ],
-        "thinking": {"type": "disabled"},
-        "max_tokens": cfg["max_tokens"],
-        "temperature": 0.85,
-    }
-
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {cfg['api_key']}",
-    }
+    if ZhipuAiClient is None:
+        logger.error("zai 未安装，无法调用 GLM；请先安装 zai")
+        return None
 
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(GLM_API_URL, json=payload, headers=headers)
-            response.raise_for_status()
-            data = response.json()
-    except httpx.HTTPStatusError as exc:
-        logger.error("GLM API HTTP 错误 {}: {}", exc.response.status_code, exc.response.text)
-        return None
-    except httpx.HTTPError as exc:
-        logger.error("GLM API 请求失败: {}", exc)
-        return None
-    except (KeyError, IndexError, TypeError) as exc:
+        content = await asyncio.to_thread(_chat_completion, cfg, question)
+    except (KeyError, IndexError, TypeError, AttributeError) as exc:
         logger.error("GLM API 响应解析失败: {}", exc)
         return None
+    except Exception as exc:
+        logger.error("GLM API 请求失败: {}", exc)
+        return None
 
-    message = data["choices"][0]["message"]
-    content = (message.get("content") or "").strip()
     if not content:
         return None
     content = content.split("\n")[0].strip()
