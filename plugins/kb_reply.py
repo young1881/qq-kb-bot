@@ -12,6 +12,7 @@ from .glm_chat import ask_glm
 
 
 KB_PATH = Path(__file__).resolve().parents[1] / "kb.jsonl"
+KB_MATCH_THRESHOLD = 70
 
 MISS_REPLIES = [
     "这题超纲了，酒老师的语料库里没有，我也编不出来。",
@@ -58,7 +59,7 @@ def load_kb():
     return docs
 
 
-def search_answer(query: str, threshold: int = 60):
+def search_answer(query: str, threshold: int = KB_MATCH_THRESHOLD):
     docs = load_kb()
 
     if not docs:
