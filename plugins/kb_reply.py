@@ -3,9 +3,12 @@ import random
 from pathlib import Path
 
 from rapidfuzz import process, fuzz
+from loguru import logger
 from nonebot import on_message
 from nonebot.rule import to_me
 from nonebot.adapters.onebot.v11 import GroupMessageEvent, Message
+
+from .glm_chat import ask_glm
 
 
 KB_PATH = Path(__file__).resolve().parents[1] / "kb.jsonl"
@@ -78,6 +81,12 @@ async def handle_at_message(event: GroupMessageEvent):
     answer, score = search_answer(text)
 
     if answer is None:
+        logger.info("语料库未命中 (score={:.1f})，尝试 GLM 兜底: {}", score, text)
+        glm_answer = await ask_glm(text)
+        if glm_answer:
+            await matcher.finish(Message(glm_answer))
+            return
         await matcher.finish("这个问题我还没有收录到语料库里。")
+        return
 
     await matcher.finish(Message(answer))
