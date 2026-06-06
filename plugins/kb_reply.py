@@ -6,7 +6,7 @@ from rapidfuzz import process, fuzz
 from loguru import logger
 from nonebot import on_message
 from nonebot.rule import to_me
-from nonebot.adapters.onebot.v11 import GroupMessageEvent, Message
+from nonebot.adapters.onebot.v11 import GroupMessageEvent, Message, MessageSegment
 
 from .glm_chat import ask_glm
 
@@ -39,6 +39,10 @@ MISS_REPLIES = [
 
 def random_miss_reply() -> str:
     return random.choice(MISS_REPLIES)
+
+
+def reply_to_user(user_id: int, content: str) -> Message:
+    return Message(MessageSegment.at(user_id)) + " " + content
 
 
 def load_kb():
@@ -101,9 +105,10 @@ matcher = on_message(rule=to_me(), priority=10, block=True)
 @matcher.handle()
 async def handle_at_message(event: GroupMessageEvent):
     text = event.get_plaintext().strip()
+    user_id = event.user_id
 
     if not text:
-        await matcher.finish("你想问什么？可以 @我 + 问题。")
+        await matcher.finish(reply_to_user(user_id, "你想问什么？可以 @我 + 问题。"))
 
     answer, score = search_answer(text)
 
@@ -111,9 +116,9 @@ async def handle_at_message(event: GroupMessageEvent):
         logger.info("语料库未命中 (score={:.1f})，尝试 GLM 兜底: {}", score, text)
         glm_answer = await ask_glm(text)
         if glm_answer:
-            await matcher.finish(Message(glm_answer))
+            await matcher.finish(reply_to_user(user_id, glm_answer))
             return
-        await matcher.finish(random_miss_reply())
+        await matcher.finish(reply_to_user(user_id, random_miss_reply()))
         return
 
-    await matcher.finish(Message(answer))
+    await matcher.finish(reply_to_user(user_id, answer))
