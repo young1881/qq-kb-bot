@@ -11,6 +11,7 @@ from nonebot.rule import to_me
 from nonebot.adapters.onebot.v11 import GroupMessageEvent, Message, MessageSegment
 
 from .glm_chat import ask_glm
+from .web_search import search_web
 
 
 KB_PATH = Path(__file__).resolve().parents[1] / "kb.jsonl"
@@ -18,8 +19,25 @@ KB_DIRECT_THRESHOLD = 92
 KB_REFERENCE_THRESHOLD = 50
 KB_MAX_REFERENCES = 5
 GROUP_HISTORY_LIMIT = 10
+GROUP_HISTORY_CONTEXT_LIMIT = 4
 GROUP_HISTORY = defaultdict(lambda: deque(maxlen=GROUP_HISTORY_LIMIT + 1))
 KB_CACHE = {"mtime": None, "docs": []}
+
+TOPIC_SHIFT_RE = re.compile(
+    r"(换个话题|另一个问题|另外问|不说这个|先不聊|说正事|对了|顺便问|再问个|新问题)"
+)
+CONTEXT_DEPENDENT_RE = re.compile(
+    r"(上面|前面|刚才|刚刚|继续|接着|这个|那个|这事|那事|它|他|她|他们|她们|怎么弄|怎么办|什么意思|啥意思)"
+)
+WEB_SEARCH_RE = re.compile(
+    r"(搜一下|查一下|帮我查|联网|上网|搜索|资料|来源|出处|官网|链接|最新|今天|现在|今年|新闻|公告|发布|更新|版本|价格|排名|政策|赛事|论文|文档|报错|错误|bug|解决方案|教程|什么梗|梗|黑话|网络用语|什么意思|啥意思)",
+    re.I,
+)
+SERIOUS_QUESTION_RE = re.compile(
+    r"(为什么|为啥|怎么|如何|是否|有没有|是什么|区别|原理|推荐|评价|分析|解释|原因|方案|步骤|教程|报错|失败)",
+    re.I,
+)
+HISTORY_STOPWORDS = set("的是了嘛吗呢啊吧和以及然后但是如果因为所以这个那个什么怎么为什么一下一个")
 
 INJECTION_PATTERNS = [
     r"忽略(之前|以上|前面).*(指令|规则|提示)",
@@ -234,6 +252,35 @@ def _clean_history_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()[:120]
 
 
+def _history_terms(text: str) -> set[str]:
+    lowered = text.lower()
+    terms = set(re.findall(r"[a-z0-9][a-z0-9_+-]{1,}", lowered))
+    terms.update(
+        char
+        for char in lowered
+        if "\u4e00" <= char <= "\u9fff" and char not in HISTORY_STOPWORDS
+    )
+    return terms
+
+
+def _is_related_history(query: str, history_text: str) -> bool:
+    query_terms = _history_terms(query)
+    history_terms = _history_terms(history_text)
+    if not query_terms or not history_terms:
+        return False
+
+    overlap = query_terms & history_terms
+    if len(overlap) >= 2:
+        return True
+
+    alpha_overlap = {
+        term
+        for term in overlap
+        if re.fullmatch(r"[a-z0-9][a-z0-9_+-]{1,}", term)
+    }
+    return bool(alpha_overlap)
+
+
 def remember_group_message(event: GroupMessageEvent):
     text = _clean_history_text(event.get_plaintext())
     if not text:
@@ -248,16 +295,46 @@ def remember_group_message(event: GroupMessageEvent):
     )
 
 
-def recent_group_context(event: GroupMessageEvent) -> list[str]:
+def recent_group_context(event: GroupMessageEvent, query: str) -> list[str]:
     items = [
         item
         for item in GROUP_HISTORY[event.group_id]
         if item["message_id"] != event.message_id
     ]
+    if not items or TOPIC_SHIFT_RE.search(query):
+        return []
+
+    recent_items = items[-GROUP_HISTORY_LIMIT:]
+    if CONTEXT_DEPENDENT_RE.search(query):
+        selected = recent_items[-GROUP_HISTORY_CONTEXT_LIMIT:]
+    else:
+        selected = [
+            item
+            for item in recent_items
+            if _is_related_history(query, item["text"])
+        ][-GROUP_HISTORY_CONTEXT_LIMIT:]
+
     return [
         "{name}: {text}".format(name=item["name"], text=item["text"])
-        for item in items[-GROUP_HISTORY_LIMIT:]
+        for item in selected
     ]
+
+
+def should_search_web(query: str, best_score: float, references: list[dict[str, object]]) -> bool:
+    text = query.strip()
+    if not text:
+        return False
+
+    if WEB_SEARCH_RE.search(text):
+        return True
+
+    if len(text) < 12:
+        return False
+
+    if SERIOUS_QUESTION_RE.search(text) and (not references or best_score < 70):
+        return True
+
+    return False
 
 
 history_matcher = on_message(priority=1, block=False)
@@ -281,16 +358,28 @@ async def handle_at_message(event: GroupMessageEvent):
         await matcher.finish(reply_to_user(event, safety_reply))
 
     answer, score, references = search_kb(text)
-    history = recent_group_context(event)
+    history = recent_group_context(event, text)
 
     if answer is None:
+        web_results = []
+        if should_search_web(text, score, references):
+            logger.info("问题需要联网搜索 (score={:.1f}, refs={}): {}", score, len(references), text)
+            web_results = await search_web(text)
+
         logger.info(
-            "语料库未直接命中 (score={:.1f}, refs={})，尝试 GLM 兜底: {}",
+            "语料库未直接命中 (score={:.1f}, refs={}, history={}, web={})，尝试 GLM 兜底: {}",
             score,
             len(references),
+            len(history),
+            len(web_results),
             text,
         )
-        glm_answer = await ask_glm(text, references=references, history=history)
+        glm_answer = await ask_glm(
+            text,
+            references=references,
+            history=history,
+            web_results=web_results,
+        )
         if glm_answer:
             await matcher.finish(reply_to_user(event, glm_answer))
             return
